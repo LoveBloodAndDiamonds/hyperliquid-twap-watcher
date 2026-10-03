@@ -19,10 +19,10 @@ from hl_twap_watcher import (
 
 async def on_created(event: TwapCreatedEvent) -> None:
     """Печатает найденный ордер."""
-    notional = f"${event['notional_usd']:,.0f}" if event["notional_usd"] else "—"
     logger.info(
-        f"CREATED  #{event['twap_id']} {event['coin']:<8} {event['side']:<4} {notional:>14} "
-        f"{event['minutes']:>5} min  age {event['age_sec']:>8.0f}s  {event['wallet']}"
+        f"CREATED  #{event['twap_id']} {event['coin']:<8} {event['side']:<4} "
+        f"${event['notional_usd']:>13,.0f} {event['minutes']:>5} min  age {event['age_sec']:>8.0f}s  "
+        f"tracked={event['tracked']}  {event['wallet']}"
     )
 
 
@@ -35,10 +35,13 @@ def on_slice(event: TwapSliceEvent) -> None:
 
 
 async def on_finished(event: TwapFinishedEvent) -> None:
-    """Печатает завершенный ордер."""
+    """Печатает завершенный ордер и задержку, с которой о нем узнали."""
+    # Время завершения биржа отдает с точностью до секунды.
+    delay = (event["detected_at_ms"] - event["finished_at_ms"]) / 1000
     logger.info(
         f"FINISHED #{event['twap_id']} {event['coin']:<8} {event['reason']:<9} "
-        f"executed {event['executed_size']}/{event['size']} avg {event['average_price']}"
+        f"executed {event['executed_size']}/{event['size']} avg {event['average_price']}  "
+        f"delay ~{delay:.1f}s"
     )
 
 

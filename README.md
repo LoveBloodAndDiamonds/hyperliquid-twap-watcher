@@ -1,14 +1,14 @@
 # hyperliquid-twap-watcher
 
-Async Python library that watches **TWAP orders on Hyperliquid** and delivers three kinds of events to your callbacks:
+Async Python library that watches **large TWAP orders on Hyperliquid** and delivers three kinds of events to your callbacks:
 
 | Event | When |
 |---|---|
-| `created` | an active TWAP order on a perp is found |
-| `slice` | a slice of a found TWAP is filled |
-| `finished` | a found TWAP is completed, cancelled, stopped by `stopPx` or failed |
+| `created` | an active perp TWAP of at least `min_notional_usd` ($100k by default) is found |
+| `slice` | a slice of a tracked TWAP is filled — within ~0.5 s, with the exact TWAP id |
+| `finished` | a tracked TWAP is completed, cancelled, stopped by `stopPx` or failed — within ~1 s |
 
-Hyperliquid has no global TWAP stream, so the library reconstructs it from public data. No API keys are needed.
+Hyperliquid has no global TWAP stream, so the library finds TWAPs from public market data and then follows each one through per-wallet WebSocket subscriptions. Only the official API is used, no API keys are needed, and REST is called only to load the perp list.
 
 ## Installation
 
@@ -96,7 +96,8 @@ watcher = TwapWatcher(on_event=on_event)
 | `reduce_only`, `randomize` | `bool` | Order flags |
 | `created_at_ms` / `detected_at_ms` | `int` | Exchange creation time / detection time |
 | `age_sec` | `float` | Order age at detection |
-| `mid_price` / `notional_usd` | `float \| None` | Mid price and `size × mid_price` |
+| `mid_price` / `notional_usd` | `float` | Mid price and `size × mid_price` |
+| `tracked` | `bool` | `False` if all tracking slots were busy: no `slice`/`finished` will follow |
 
 The exchange reports **all active** orders of a wallet, so `created` also fires for orders placed hours or days ago — use `age_sec` to filter fresh ones. After a restart, still-active orders are reported again.
 
@@ -106,13 +107,10 @@ One event per trade: a slice that hits several price levels comes as several eve
 
 | Field | Type | Description |
 |---|---|---|
-| `twap_id` | `int \| None` | Owning order; `None` if ambiguous (see below) |
-| `candidate_twap_ids` | `list[int]` | All tracked orders of the wallet with this coin and side |
+| `twap_id` | `int` | Owning order |
 | `wallet`, `coin`, `side` | | As above |
 | `price`, `size`, `notional_usd` | `float` | Fill price, size, `price × size` |
 | `time_ms`, `trade_id` | `int` | Trade time and exchange trade id |
-
-Trades carry no TWAP id, so a slice is matched by wallet + coin + side. If a wallet runs two TWAPs with the same coin and side at once, `twap_id` is `None` and both ids are in `candidate_twap_ids`.
 
 ### `finished` — `TwapFinishedEvent`
 
@@ -129,43 +127,52 @@ plus `twap_id`, `wallet`, `coin`, `side`, `minutes`, `created_at_ms`.
 
 ## How it works
 
-1. **Candidates.** One WebSocket listens to `trades` for every perp plus `allMids`. Engine-executed trades have a zero hash — that is how TWAP slices (and also liquidations/ADL) look. Both participants become candidates.
-2. **Detection.** `twapStates` can only be subscribed per wallet. The exchange allows 15 tracked users per backend node per IP (about 3 nodes behind the load balancer), so connections that land on the same node share 15 slots. A pool of connections rotates candidates through 14 slots each (5 s per wallet) and reconnects a connection that turns out to share a node with another one.
-3. **Slices.** Every zero-hash trade is matched against tracked orders.
-4. **Completion.** Slices of a live TWAP arrive every ~30 s. After 90 s of silence the watcher requests the wallet's `twapHistory` and emits `finished` with the exact final status. Live-but-silent orders (e.g. waiting for a trigger) are re-checked with exponential backoff.
+```
+trades + allMids (all perps)  →  wallets from engine-executed (zero-hash) trades
+            ↓
+DISCOVERY   1 connection × 14 slots, twapStates for 2 s per wallet
+            ↓  TWAP ≥ min_notional_usd → created
+TRACKING    2 connections × 14 wallets: userTwapHistory + userTwapSliceFills
+            ├─ slice fills with twapId   → slice
+            ├─ final status in history   → finished (slot freed when the wallet has no TWAPs left)
+            └─ new "activated" TWAP ≥ N  → created
+```
 
-Consequences worth knowing:
+1. **Candidates.** Engine-executed trades have a zero hash — that is how TWAP slices (and also liquidations/ADL) look. Both participants become candidates. Wallets that are already tracked are skipped: their new TWAPs arrive through their history subscription.
+2. **Discovery.** `twapStates` can only be subscribed per wallet. A connection rotates candidates through its 14 slots, 2 s each (the exchange answers in ~0.5 s).
+3. **Tracking.** A wallet with a large TWAP keeps two subscriptions until all of its tracked TWAPs finish. On every (re)connect the exchange sends a snapshot, so fills and statuses missed during a reconnect are recovered.
 
-- Detection is **sampling**, not a firehose: a TWAP is found once one of its slices shows up and its wallet gets a slot. Typical latency is seconds; under heavy load the candidate queue drops stale entries.
-- `finished` arrives **≥ 90 s** after the real finish.
-- Only perps of the main dex are reported (no spot, no builder-deployed dexes).
+### Exchange limits
+
+The exchange allows **15 tracked users per backend node per IP**, and there are about 3 nodes behind the load balancer (~44 wallets per IP). All subscriptions to one wallet count as one user. Connections that land on the same node share its 15 slots; a connection that gets rejected while it is mostly empty reconnects (at most once a minute) to land on another node.
+
+Defaults use one connection per node: 14 discovery slots + 28 tracking wallets. Live observations show ~22 wallets with ≥ $100k TWAPs at a time. If tracking is full, `created` still arrives with `tracked=False` and a warning is logged.
 
 ## Configuration
 
-All technical knobs live in `WatcherConfig`; defaults fit Hyperliquid's per-IP limits.
+All technical knobs live in `WatcherConfig`:
 
 ```python
 from hl_twap_watcher import TwapWatcher, WatcherConfig
 
 watcher = TwapWatcher(
     on_event=handler,
-    config=WatcherConfig(slice_silence_seconds=120, rest_requests_per_minute=20),
+    config=WatcherConfig(min_notional_usd=250_000),
     logger=my_logger,  # loguru (default) or logging.Logger
 )
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `watchers_count` | `2` | `twapStates` connections. 3 is the useful maximum (one per exchange node); 2 leaves a node free for other apps on the same IP |
-| `watch_ttl` | `5.0` | Seconds a wallet holds a slot |
+| `min_notional_usd` | `100_000` | Minimal `size × mid` of a reported TWAP |
+| `discovery_connections` | `1` | `twapStates` rotation connections (14 slots each) |
+| `tracking_connections` | `2` | Tracking connections (14 wallets each) |
+| `watch_ttl` | `2.0` | Seconds a candidate holds a discovery slot |
 | `queue_wait_seconds` | `30.0` | Max candidate age in the queue |
-| `slice_silence_seconds` | `90.0` | Silence before a completion check |
-| `check_cooldown_seconds` / `check_max_backoff_seconds` | `60` / `900` | Re-check backoff for live orders |
-| `finished_grace_seconds` | `3600` | Drop an order missing from history this long after its planned end |
-| `rest_requests_per_minute` | `40` | Budget for `twapHistory` requests (weight 20 of 1200/min) |
+| `wallet_recheck_seconds` | `20.0` | Min pause before the same wallet is checked again |
 | `markets_refresh_seconds` | `600` | Perp list refresh (new listings) |
 
-`watcher.stats()` returns counters: trades seen, candidates queued/dropped, wallets checked, subscription rejects, pool reconnects, tracked orders, events emitted, callback errors.
+`watcher.stats()` returns counters: trades seen, candidates queued/dropped, wallets checked, subscription rejects, node reconnects, tracked TWAPs and wallets, tracking capacity, TWAPs skipped because tracking was full, events emitted, callback errors.
 
 ## Development
 

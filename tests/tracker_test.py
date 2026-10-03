@@ -184,20 +184,39 @@ async def test_activated_record_reports_new_twap() -> None:
     assert events == []
 
 
-async def test_limit_error_marks_connection_and_reconnects_once() -> None:
+async def test_limit_error_reconnects_with_growing_pause() -> None:
     tracker, [ws], _, _ = make_tracker()
     await tracker.track(WALLET, 1, since_ms=0)
     connection = tracker._connections[0]
 
     await tracker._handle_message(connection, LIMIT_ERROR)
+    await tracker._leave_crowded_node(connection)  # первый уход — сразу
+    assert ws.reconnects == 1
+
+    # Новая нода тоже занята: повтор только после паузы.
+    connection.crowded = True
     await tracker._leave_crowded_node(connection)
-    await tracker._leave_crowded_node(connection)  # раньше интервала — нет
+    assert ws.reconnects == 1
+
+    connection.last_reconnect_at -= 6
+    await tracker._leave_crowded_node(connection)
+    assert ws.reconnects == 2
+    assert connection.reconnect_streak == 2
 
     assert tracker.rejected == 1
-    assert ws.reconnects == 1
-    assert tracker.reconnects == 1
     # Кошелек остается за соединением: подписка повторится после реконнекта.
     assert tracker.is_tracked(WALLET)
+
+
+async def test_reconnect_streak_resets_when_stable() -> None:
+    tracker, _, _, _ = make_tracker()
+    connection = tracker._connections[0]
+    connection.reconnect_streak = 3
+    connection.last_reconnect_at -= 121
+
+    await tracker._leave_crowded_node(connection)
+
+    assert connection.reconnect_streak == 0
 
 
 async def test_subscription_confirm_clears_pending() -> None:
