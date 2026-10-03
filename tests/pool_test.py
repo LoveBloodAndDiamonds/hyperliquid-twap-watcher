@@ -1,6 +1,7 @@
 """Пул `twapStates`: учет подписок, отказы биржи, отсев и дедупликация ордеров."""
 
 import asyncio
+import time
 from typing import Any
 
 from hl_twap_watcher._markets import Markets
@@ -98,3 +99,74 @@ def test_unknown_perp_is_not_remembered() -> None:
     pool._handle_message(state, states_message((1, make_state(coin="NEW"))))
 
     assert [twap_id for twap_id, _ in found] == [1]
+
+
+def test_reject_cooldown_grows_and_resets() -> None:
+    pool, _, _ = make_pool()
+    state = _SlotState()
+    limit_error = {"channel": "error", "data": "Cannot track more than 15 total users"}
+
+    cooldowns = []
+    for _ in range(6):
+        state.pending.append((WALLET, 0.0))
+        before = time.time()
+        pool._handle_message(state, limit_error)
+        cooldowns.append(round(state.blocked_until - before))
+
+    assert cooldowns == [1, 2, 4, 8, 16, 16]
+
+    # Успешная подписка сбрасывает серию.
+    state.pending.append((WALLET, 0.0))
+    pool._handle_message(
+        state,
+        {
+            "channel": "subscriptionResponse",
+            "data": {"method": "subscribe", "subscription": {"type": "twapStates", "user": WALLET}},
+        },
+    )
+    assert state.reject_streak == 0
+
+
+class FakeWebsocket:
+    """Запоминает запросы на пересоздание соединения."""
+
+    def __init__(self) -> None:
+        self.reconnects = 0
+
+    async def reconnect(self) -> None:
+        self.reconnects += 1
+
+
+async def test_crowded_node_triggers_reconnect_once_per_interval() -> None:
+    from hl_twap_watcher._pool import _Slot
+
+    pool, queue, _ = make_pool()
+    websocket = FakeWebsocket()
+    slot = _Slot(websocket=websocket)  # type: ignore[arg-type]
+    limit_error = {"channel": "error", "data": "Cannot track more than 15 total users"}
+
+    # Соединение почти пустое, а биржа отказывает — ноду занял кто-то еще.
+    for _ in range(5):
+        slot.state.pending.append((WALLET, 0.0))
+        pool._handle_message(slot.state, limit_error)
+    slot.state.pending.append(("0xpending", 0.0))
+
+    await pool._leave_crowded_node(slot)
+    await pool._leave_crowded_node(slot)  # второй раз раньше интервала — нет
+
+    assert websocket.reconnects == 1
+    assert pool.reconnects == 1
+    # Непроверенный кандидат вернулся в очередь.
+    assert "0xpending" in [queue.get_nowait() for _ in range(queue.qsize())]
+
+
+def test_rejects_on_full_connection_are_not_crowded() -> None:
+    pool, _, _ = make_pool()
+    state = _SlotState()
+    for index in range(13):
+        state.tracked[f"0x{index}"] = 0.0
+    state.pending.append((WALLET, 0.0))
+
+    pool._handle_message(state, {"channel": "error", "data": "Cannot track more than 15 total users"})
+
+    assert state.crowded_rejects == 0

@@ -82,6 +82,7 @@ class Websocket:
         self._conn: ClientConnection | None = None
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._running = False
+        self._reconnect_requested = False
 
     @property
     def running(self) -> bool:
@@ -106,13 +107,17 @@ class Websocket:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    # Закрытие по stop() тоже приходит исключением — его не логируем.
-                    if self._running:
+                    # Закрытие по stop() и reconnect() тоже приходит исключением —
+                    # это не ошибка.
+                    if self._reconnect_requested:
+                        self._logger.info(f"Websocket {self._name} reconnecting on request")
+                    elif self._running:
                         self._logger.error(
                             f"Websocket {self._name} error: {exc!r}, "
                             f"reconnecting in {self._reconnect_timeout}s"
                         )
 
+                self._reconnect_requested = False
                 if self._running:
                     await asyncio.sleep(self._reconnect_timeout)
         finally:
@@ -126,6 +131,16 @@ class Websocket:
         if conn is not None:
             with suppress(Exception):
                 await conn.close()
+
+    async def reconnect(self) -> None:
+        """Пересоздает соединение, не останавливая вебсокет: подписки повторятся сами."""
+        conn = self._conn
+        if conn is None:
+            return
+
+        self._reconnect_requested = True
+        with suppress(Exception):
+            await conn.close()
 
     async def send(self, message: dict[str, Any]) -> None:
         """Отправляет сообщение в текущее соединение.

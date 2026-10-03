@@ -130,7 +130,7 @@ plus `twap_id`, `wallet`, `coin`, `side`, `minutes`, `created_at_ms`.
 ## How it works
 
 1. **Candidates.** One WebSocket listens to `trades` for every perp plus `allMids`. Engine-executed trades have a zero hash — that is how TWAP slices (and also liquidations/ADL) look. Both participants become candidates.
-2. **Detection.** `twapStates` can only be subscribed per wallet, at most 14 per connection and ~30 per IP. A pool of connections rotates candidates through these slots (5 s each) and reports new orders.
+2. **Detection.** `twapStates` can only be subscribed per wallet. The exchange allows 15 tracked users per backend node per IP (about 3 nodes behind the load balancer), so connections that land on the same node share 15 slots. A pool of connections rotates candidates through 14 slots each (5 s per wallet) and reconnects a connection that turns out to share a node with another one.
 3. **Slices.** Every zero-hash trade is matched against tracked orders.
 4. **Completion.** Slices of a live TWAP arrive every ~30 s. After 90 s of silence the watcher requests the wallet's `twapHistory` and emits `finished` with the exact final status. Live-but-silent orders (e.g. waiting for a trigger) are re-checked with exponential backoff.
 
@@ -156,7 +156,7 @@ watcher = TwapWatcher(
 
 | Option | Default | Meaning |
 |---|---|---|
-| `watchers_count` | `2` | `twapStates` connections (2 × 14 slots is the per-IP ceiling) |
+| `watchers_count` | `2` | `twapStates` connections. 3 is the useful maximum (one per exchange node); 2 leaves a node free for other apps on the same IP |
 | `watch_ttl` | `5.0` | Seconds a wallet holds a slot |
 | `queue_wait_seconds` | `30.0` | Max candidate age in the queue |
 | `slice_silence_seconds` | `90.0` | Silence before a completion check |
@@ -165,7 +165,7 @@ watcher = TwapWatcher(
 | `rest_requests_per_minute` | `40` | Budget for `twapHistory` requests (weight 20 of 1200/min) |
 | `markets_refresh_seconds` | `600` | Perp list refresh (new listings) |
 
-`watcher.stats()` returns counters: trades seen, candidates queued/dropped, wallets checked, subscription rejects, tracked orders, events emitted, callback errors.
+`watcher.stats()` returns counters: trades seen, candidates queued/dropped, wallets checked, subscription rejects, pool reconnects, tracked orders, events emitted, callback errors.
 
 ## Development
 

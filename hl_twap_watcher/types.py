@@ -214,6 +214,9 @@ class WatcherStats(TypedDict):
     subscriptions_rejected: int
     """Сколько подписок биржа отклонила по лимиту."""
 
+    pool_reconnects: int
+    """Сколько раз соединение пула пересоздавалось, чтобы уйти с занятой ноды биржи."""
+
     tracked_twaps: int
     """Сколько ордеров сейчас под наблюдением."""
 

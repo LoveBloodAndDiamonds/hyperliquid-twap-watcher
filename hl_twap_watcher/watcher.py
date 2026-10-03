@@ -201,6 +201,7 @@ class TwapWatcher:
             queue_max=self._pool.queue_max,
             wallets_checked=self._pool.checked,
             subscriptions_rejected=self._pool.rejected,
+            pool_reconnects=self._pool.reconnects,
             tracked_twaps=len(self._registry),
             liveness_checks=self._liveness.checks,
             events_created=self._dispatcher.created,

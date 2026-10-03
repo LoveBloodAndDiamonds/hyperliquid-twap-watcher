@@ -37,6 +37,13 @@ class _SlotState:
     blocked_until: float = 0.0
     """До этого момента новые подписки не отправляем: биржа только что отказала."""
 
+    reject_streak: int = 0
+    """Сколько отказов подряд получило соединение: от этого растет пауза."""
+
+    crowded_rejects: int = 0
+    """Сколько отказов пришло, когда само соединение занимало меньше половины слотов.
+    Признак того, что лимит его ноды съедает кто-то еще."""
+
 
 @dataclass
 class _Slot:
@@ -45,6 +52,7 @@ class _Slot:
     websocket: Websocket
     state: _SlotState = field(default_factory=_SlotState)
     tasks: list[asyncio.Task] = field(default_factory=list)
+    last_reconnect_at: float = 0.0
 
 
 class TwapStatesPool:
@@ -53,16 +61,31 @@ class TwapStatesPool:
     Подписка на `twapStates` возможна только по конкретному кошельку, а на одно
     соединение их влезает 14. Поэтому кандидат занимает слот на `watch_ttl` секунд —
     за это время успевает прийти состояние всех его TWAP — и уступает место следующему.
+
+    Лимит "15 total users" биржа считает не на соединение и не на IP, а на
+    серверную ноду за балансировщиком (их около трех). Два соединения, попавшие
+    на одну ноду, делят 15 слотов на двоих. Такое соединение пересоздается, чтобы
+    попасть на другую ноду.
     """
 
     _POLL_INTERVAL = 0.3
     """Как часто соединение проверяет TTL подписок и добирает кандидатов, секунды."""
 
     _REJECT_COOLDOWN = 1.0
-    """Пауза соединения после отказа биржи в подписке, секунды."""
+    """Пауза соединения после первого отказа биржи в подписке, секунды."""
+
+    _MAX_REJECT_COOLDOWN = 16.0
+    """Предел паузы при серии отказов, секунды."""
 
     _PENDING_TIMEOUT = 5.0
     """Сколько ждать ответ биржи на подписку, прежде чем считать слот свободным."""
+
+    _CROWDED_REJECTS_TO_RECONNECT = 5
+    """После скольких отказов на занятой ноде соединение пересоздается."""
+
+    _MIN_RECONNECT_INTERVAL = 60.0
+    """Не чаще одного пересоздания соединения за столько секунд: если ноды заняты
+    другим приложением на том же IP, переподключения не помогут."""
 
     def __init__(
         self,
@@ -101,6 +124,9 @@ class TwapStatesPool:
 
         self.queue_max = 0
         """Пиковая глубина очереди."""
+
+        self.reconnects = 0
+        """Сколько раз соединение пересоздавалось, чтобы уйти с занятой ноды."""
 
     async def start(self) -> None:
         """Поднимает `watchers_count` независимых соединений."""
@@ -163,6 +189,7 @@ class TwapStatesPool:
                     self._drop_stale_pending(state)
                     await self._release_expired(slot.websocket, state)
                     await self._fill_free_slots(slot.websocket, state)
+                    await self._leave_crowded_node(slot)
 
                 self.queue_max = max(self.queue_max, self._queue.qsize())
 
@@ -174,6 +201,30 @@ class TwapStatesPool:
                 self._logger.debug(f"Twap states slot loop error: {exc!r}")
 
             await asyncio.sleep(self._POLL_INTERVAL)
+
+    async def _leave_crowded_node(self, slot: _Slot) -> None:
+        """Пересоздает соединение, если его нода занята кем-то еще."""
+        state = slot.state
+        now = time.time()
+
+        if state.crowded_rejects < self._CROWDED_REJECTS_TO_RECONNECT:
+            return
+        if now - slot.last_reconnect_at < self._MIN_RECONNECT_INTERVAL:
+            return
+
+        slot.last_reconnect_at = now
+        self.reconnects += 1
+        self._logger.info(
+            f"Twap states connection shares exchange node limit "
+            f"({state.crowded_rejects} rejects with {len(state.tracked)} own slots), reconnecting"
+        )
+
+        # Кандидаты без ответа биржи еще не проверены — не теряем их.
+        for user, _ in state.pending:
+            self._queue.put_nowait(user)
+        state.pending.clear()
+
+        await slot.websocket.reconnect()
 
     def _drop_stale_pending(self, state: _SlotState) -> None:
         """Освобождает слоты подписок, ответ по которым так и не пришел."""
@@ -254,6 +305,7 @@ class TwapStatesPool:
 
         state.pending.remove(item)
         state.tracked[user] = time.time()
+        state.reject_streak = 0
         self.checked += 1
 
     def _handle_error(self, state: _SlotState, text: str) -> None:
@@ -268,9 +320,18 @@ class TwapStatesPool:
         user, _ = state.pending.popleft()
         self.rejected += 1
 
+        # Своя нода вмещает 15 подписок, а соединение занимает 14. Отказ при
+        # полупустом соединении значит, что слоты ноды заняты другим соединением.
+        if len(state.tracked) < MAX_USERS_PER_WS // 2:
+            state.crowded_rejects += 1
+
         # Лимит общий на все соединения, поэтому упереться в него можно и с
-        # пустыми слотами. Даем бирже паузу и возвращаем кошелек в очередь.
-        state.blocked_until = time.time() + self._REJECT_COOLDOWN
+        # пустыми слотами. Даем бирже паузу и возвращаем кошелек в очередь. Пауза
+        # растет с серией отказов: долбить биржу подписками — тратить лимит
+        # сообщений на IP, а слоты все равно не освободятся раньше.
+        cooldown = self._REJECT_COOLDOWN * 2 ** min(state.reject_streak, 4)
+        state.blocked_until = time.time() + min(cooldown, self._MAX_REJECT_COOLDOWN)
+        state.reject_streak += 1
         self._queue.put_nowait(user)
 
     def _handle_twap_state(self, twap_id: int, data: dict[str, Any]) -> None:
