@@ -1,0 +1,17 @@
+{
+  "include": ["hl_twap_watcher"],
+  "exclude": [
+    "**/__pycache__",
+    "**/.venv",
+    "**/.git",
+    "**/.idea",
+    "tests",
+    "examples"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic"
+}

@@ -1,10 +1,35 @@
-# Python-generated files
+# Agents
+.claude
+
+# System files
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Byte-compiled / optimized files
 __pycache__/
-*.py[oc]
+*.py[cod]
+
+# Distribution / packaging
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
 .venv
+venv/
+.env
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
