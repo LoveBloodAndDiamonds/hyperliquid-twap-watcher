@@ -1,0 +1,22 @@
+name: Version check
+
+# Публикация в PyPI падает, если версия уже загружена. Ловим это до мержа в main.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check version is bumped
+        run: python .github/scripts/check_version.py
