@@ -130,3 +130,23 @@ async def test_reconnect_on_request(server: Server) -> None:
 
     await ws.stop()
     await asyncio.wait_for(task, timeout=3)
+
+
+async def test_remove_subscription(server: Server) -> None:
+    async def on_message(msg: dict[str, Any]) -> None: ...
+
+    subscription = {"method": "subscribe", "subscription": {"type": "userTwapHistory", "user": "0x1"}}
+    ws = Websocket(server.url, on_message, ping_message=None, reconnect_timeout=0.05)
+    task = asyncio.create_task(ws.start())
+    await wait_for(lambda: ws.connected)
+
+    assert await ws.add_subscription(subscription) is True
+    await ws.remove_subscription(subscription)
+
+    # Отписка ушла в текущее соединение, а в список реконнекта подписка не вернется.
+    await wait_for(lambda: len(server.received) == 2)
+    assert server.received[1] == {**subscription, "method": "unsubscribe"}
+    assert ws.subscriptions == []
+
+    await ws.stop()
+    await asyncio.wait_for(task, timeout=3)

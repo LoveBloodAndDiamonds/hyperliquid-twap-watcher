@@ -4,6 +4,7 @@ __all__ = ["TwapWatcher"]
 
 import asyncio
 import time
+from collections import OrderedDict
 from contextlib import suppress
 from typing import Any, Self
 
@@ -11,13 +12,12 @@ import aiohttp
 from loguru import logger as _logger
 
 from ._dispatcher import Dispatcher
-from ._events import build_created, build_slice
+from ._events import build_created
 from ._http import InfoClient
-from ._liveness import TwapLiveness
 from ._market_stream import MarketStream
 from ._markets import Markets
-from ._pool import TwapStatesPool
-from ._registry import TwapRegistry
+from ._pool import DiscoveryPool
+from ._tracker import TwapTracker
 from .config import WatcherConfig
 from .types import (
     Callback,
@@ -25,7 +25,6 @@ from .types import (
     TwapCreatedEvent,
     TwapEvent,
     TwapFinishedEvent,
-    TwapSide,
     TwapSliceEvent,
     WatcherStats,
 )
@@ -35,13 +34,13 @@ _MIDS_WAIT_SECONDS = 10.0
 
 
 class TwapWatcher:
-    """Находит TWAP-ордера Hyperliquid и сообщает о них через callback'и.
+    """Находит крупные TWAP-ордера Hyperliquid и сообщает о них через callback'и.
 
     Три события:
 
-    - `created` — найден активный TWAP-ордер на перпе;
-    - `slice` — исполнился слайс найденного ордера;
-    - `finished` — ордер завершился (доработал срок, отменен, остановлен).
+    - `created` — найден активный TWAP на перпе не меньше `min_notional_usd`;
+    - `slice` — исполнился слайс отслеживаемого ордера;
+    - `finished` — отслеживаемый ордер завершился (доработал срок, отменен, остановлен).
 
     Callback'и принимают обычные функции и корутины. Можно передать общий
     `on_event` (тип различается по `event["type"]`), специализированные или оба
@@ -75,8 +74,8 @@ class TwapWatcher:
         :param on_slice: Обработчик слайсов.
         :param on_finished: Обработчик завершенных ордеров.
         :param config: Технические параметры. По умолчанию — `WatcherConfig()`.
-        :param session: Внешняя сессия aiohttp для REST-запросов. Если не передана,
-            наблюдатель создаст и закроет свою.
+        :param session: Внешняя сессия aiohttp для REST-запроса списка перпов. Если
+            не передана, наблюдатель создаст и закроет свою.
         :param logger: Логгер. По умолчанию — loguru.
         :raises ValueError: Если не передан ни один callback.
         """
@@ -88,7 +87,6 @@ class TwapWatcher:
 
         self._client = InfoClient(self._config.info_url, session=session, logger=self._logger)
         self._markets = Markets()
-        self._registry = TwapRegistry(self._config)
         self._dispatcher = Dispatcher(
             on_event=on_event,
             on_created=on_created,
@@ -96,31 +94,34 @@ class TwapWatcher:
             on_finished=on_finished,
             logger=self._logger,
         )
+        self._tracker = TwapTracker(
+            self._config,
+            self._dispatcher.emit,
+            self._on_twap_state,
+            logger=self._logger,
+        )
 
-        # Очередь кошельков-кандидатов: поток сделок кладет, пул `twapStates` забирает.
+        # Очередь кошельков-кандидатов: поток сделок кладет, поиск забирает.
         self._candidates: asyncio.Queue[str] = asyncio.Queue()
 
         self._stream = MarketStream(
             self._config,
             self._markets,
             self._candidates,
-            self._on_zero_hash_trade,
+            self._tracker.is_tracked,
             logger=self._logger,
         )
-        self._pool = TwapStatesPool(
+        self._pool = DiscoveryPool(
             self._config,
-            self._markets,
             self._candidates,
             self._on_twap_state,
             logger=self._logger,
         )
-        self._liveness = TwapLiveness(
-            self._config,
-            self._client,
-            self._registry,
-            self._dispatcher.emit,
-            logger=self._logger,
-        )
+
+        # Пары «кошелек, ID ордера», которые уже разобраны: крупные отданы событием,
+        # мелкие отброшены. OrderedDict вместо set: нужно вытеснять самые старые.
+        self._seen: OrderedDict[tuple[str, int], None] = OrderedDict()
+        self._tracking_full = 0
 
         self._refresh_task: asyncio.Task | None = None
         self._running = False
@@ -150,17 +151,19 @@ class TwapWatcher:
         await self._dispatcher.start()
         await self._stream.start()
 
-        # Пул ждет первых цен: иначе ордера, найденные в первую секунду, придут без
-        # долларовой оценки. Ждем недолго — цены не повод не стартовать.
+        # Без цен поиск не отличит крупный ордер от мелкого — ждем первые mid-цены.
+        # Недолго: ордер без цены просто проверится при следующем появлении.
         with suppress(TimeoutError):
             await asyncio.wait_for(self._stream.mids_ready.wait(), timeout=_MIDS_WAIT_SECONDS)
 
+        await self._tracker.start()
         await self._pool.start()
-        await self._liveness.start()
         self._refresh_task = asyncio.create_task(self._refresh_markets_loop())
 
         self._running = True
-        self._logger.info("TwapWatcher started")
+        self._logger.info(
+            f"TwapWatcher started: min notional ${self._config.min_notional_usd:,.0f}"
+        )
 
     async def stop(self) -> None:
         """Останавливает потоки, доставляет накопленные события и закрывает соединения."""
@@ -171,9 +174,9 @@ class TwapWatcher:
             self._refresh_task = None
 
         # Сначала источники событий, потом доставка: иначе события теряются.
-        await self._liveness.stop()
         await self._pool.stop()
         await self._stream.stop()
+        await self._tracker.stop()
         await self._dispatcher.stop()
         await self._client.close()
 
@@ -200,39 +203,68 @@ class TwapWatcher:
             queue_size=self._candidates.qsize(),
             queue_max=self._pool.queue_max,
             wallets_checked=self._pool.checked,
-            subscriptions_rejected=self._pool.rejected,
-            pool_reconnects=self._pool.reconnects,
-            tracked_twaps=len(self._registry),
-            liveness_checks=self._liveness.checks,
+            subscriptions_rejected=self._pool.rejected + self._tracker.rejected,
+            node_reconnects=self._pool.reconnects + self._tracker.reconnects,
+            tracked_twaps=self._tracker.twaps_count,
+            tracked_wallets=self._tracker.wallets_count,
+            tracking_capacity=self._config.tracking_capacity,
+            tracking_full=self._tracking_full,
             events_created=self._dispatcher.created,
             events_slice=self._dispatcher.slices,
             events_finished=self._dispatcher.finished,
             callback_errors=self._dispatcher.errors,
         )
 
-    def _on_twap_state(self, twap_id: int, state: dict[str, Any]) -> None:
-        """Превращает впервые увиденный ордер в событие и ставит его под наблюдение."""
+    async def _on_twap_state(self, twap_id: int, state: dict[str, Any]) -> None:
+        """Разбирает активный TWAP из поиска или истории отслеживаемого кошелька.
+
+        Крупный ордер, увиденный впервые, берется под слежку и отдается событием
+        `created`. Остальное отбрасывается.
+        """
+        coin = state["coin"]
+
+        # Биржа отдает все ордера кошелька: спот (`@107`) и builder-dex (`xyz:SP500`)
+        # вне scope. Проверка до дедупликации: перп, листинг которого справочник
+        # еще не подхватил, не должен навсегда застрять в памяти повторов.
+        if not self._markets.is_perp(coin):
+            return
+
+        wallet = state["user"].lower()
+        key = (wallet, twap_id)
+        if key in self._seen or self._tracker.is_twap_tracked(wallet, twap_id):
+            return
+
+        # Без цены размер в долларах неизвестен. Не запоминаем ордер: биржа повторит
+        # его при следующей проверке кошелька, а цена к тому времени появится.
+        mid = self._markets.mid(coin)
+        if mid is None:
+            self._logger.debug(f"No mid price for {coin}, twap {twap_id} postponed")
+            return
+
+        self._remember(key)
+
+        notional = float(state["sz"]) * mid
+        if notional < self._config.min_notional_usd:
+            return
+
         now = time.time()
-        event = build_created(twap_id, state, mid_price=self._markets.mid(state["coin"]), now=now)
+        tracked = await self._tracker.track(wallet, twap_id, since_ms=int(now * 1000))
+        if not tracked:
+            self._tracking_full += 1
+            self._logger.warning(
+                f"Tracking slots are full ({self._config.tracking_capacity} wallets): "
+                f"twap {twap_id} ({coin} ${notional:,.0f}, {wallet}) will not be tracked"
+            )
 
-        self._registry.add(event, now=now)
-        self._dispatcher.emit(event)
+        self._dispatcher.emit(
+            build_created(twap_id, state, mid_price=mid, tracked=tracked, now=now)
+        )
 
-    def _on_zero_hash_trade(self, trade: dict[str, Any]) -> None:
-        """Сверяет сделку движка с отслеживаемыми ордерами и отдает слайсы."""
-        now = time.time()
-        buyer, seller = trade["users"]
-
-        # Порядок участников в сделке фиксирован: сначала покупатель, затем продавец.
-        participants: tuple[tuple[str, TwapSide], ...] = ((buyer, "BUY"), (seller, "SELL"))
-
-        for user, side in participants:
-            wallet = user.lower()
-            twap_ids = self._registry.match_slice(wallet, trade["coin"], side, now=now)
-            if twap_ids:
-                self._dispatcher.emit(
-                    build_slice(trade, wallet=wallet, side=side, twap_ids=twap_ids)
-                )
+    def _remember(self, key: tuple[str, int]) -> None:
+        """Запоминает разобранный ордер, вытесняя самые старые записи."""
+        self._seen[key] = None
+        while len(self._seen) > self._config.max_seen_twaps:
+            self._seen.popitem(last=False)
 
     async def _refresh_markets_loop(self) -> None:
         """Периодически перечитывает список перпов и подписывается на новые листинги."""

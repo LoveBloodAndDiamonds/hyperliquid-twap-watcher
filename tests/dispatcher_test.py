@@ -6,7 +6,7 @@ from hl_twap_watcher._dispatcher import Dispatcher
 from hl_twap_watcher._events import build_finished, build_slice
 from hl_twap_watcher.types import TwapEvent
 
-from .conftest import WALLET, make_created, make_record, make_trade
+from .conftest import WALLET, make_created, make_fill, make_record
 
 
 async def deliver(dispatcher: Dispatcher, *events: TwapEvent) -> None:
@@ -34,7 +34,7 @@ async def test_general_then_specific_callbacks() -> None:
     await deliver(
         dispatcher,
         make_created(),
-        build_slice(make_trade(), wallet=WALLET, side="BUY", twap_ids=[100]),
+        build_slice(make_fill(100, time_ms=1), wallet=WALLET),
         build_finished(make_record(100, "finished"), reason="completed", now=0),
     )
 

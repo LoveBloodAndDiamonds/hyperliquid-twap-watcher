@@ -1,4 +1,4 @@
-"""Глобальный поток сделок и mid-цен: поиск кошельков-кандидатов и слайсов TWAP."""
+"""Глобальный поток сделок и mid-цен: поиск кошельков-кандидатов."""
 
 __all__ = ["ZERO_HASH", "MarketStream"]
 
@@ -19,8 +19,8 @@ from .types import LoggerLike
 ZERO_HASH = "0x" + "0" * 64
 """Хеш сделки, исполненной движком биржи, а не транзакцией пользователя."""
 
-type ZeroHashTradeHandler = Callable[[dict[str, Any]], None]
-"""Обработчик сделки с нулевым хешом: сверяет ее с отслеживаемыми TWAP."""
+type TrackedCheck = Callable[[str], bool]
+"""Проверка, что кошелек уже под слежкой и искать его TWAP не нужно."""
 
 
 class MarketStream:
@@ -28,10 +28,7 @@ class MarketStream:
 
     Глобального стрима TWAP у Hyperliquid нет, поэтому кандидаты ищутся по сделкам
     с нулевым хешом: так исполняются слайсы TWAP, ликвидации и ADL. Отличить одно
-    от другого умеет только пул `twapStates` — по подписке на кошелек.
-
-    Те же сделки — источник слайсов уже найденных ордеров: их сверяет с регистром
-    обработчик `on_zero_hash_trade`.
+    от другого умеет только поиск — по подписке `twapStates` на кошелек.
     """
 
     def __init__(
@@ -39,7 +36,7 @@ class MarketStream:
         config: WatcherConfig,
         markets: Markets,
         queue: asyncio.Queue[str],
-        on_zero_hash_trade: ZeroHashTradeHandler,
+        is_tracked: TrackedCheck,
         *,
         logger: LoggerLike | None = None,
     ) -> None:
@@ -47,17 +44,16 @@ class MarketStream:
 
         :param config: Настройки наблюдателя.
         :param markets: Справочник рынков: список монет для подписки и приемник цен.
-        :param queue: Общая с пулом `twapStates` очередь адресов на проверку.
-        :param on_zero_hash_trade: Обработчик каждой сделки с нулевым хешом.
+        :param queue: Общая с поиском очередь адресов на проверку.
+        :param is_tracked: Проверка, что кошелек уже под слежкой: такой не проверяется.
         :param logger: Логгер. По умолчанию — loguru.
         """
         self._config = config
         self._markets = markets
         self._queue = queue
-        self._on_zero_hash_trade = on_zero_hash_trade
+        self._is_tracked = is_tracked
         self._logger = logger or _logger
 
-        self._dedup_ttl = config.watch_ttl * config.wallet_dedup_factor
         self._queue_limit = config.queue_limit
 
         self._websocket: Websocket | None = None
@@ -158,16 +154,18 @@ class MarketStream:
             for user in trade["users"]:
                 self._enqueue(user.lower())
 
-            self._on_zero_hash_trade(trade)
-
     def _enqueue(self, user: str) -> None:
         """Ставит кошелек в очередь на проверку, если он давно не проверялся."""
+        # Кошелек под слежкой сообщает о новых TWAP сам — через историю ордеров.
+        if self._is_tracked(user):
+            return
+
         now = time.time()
         last = self._seen_wallets.get(user)
 
-        # Слайсы одного TWAP идут каждые 30 секунд от того же кошелька: без окна
-        # дедупликации очередь забьется повторами.
-        if last is not None and now - last < self._dedup_ttl:
+        # Слайсы одного TWAP идут каждые 30 секунд от того же кошелька: без паузы
+        # очередь забьется повторами.
+        if last is not None and now - last < self._config.wallet_recheck_seconds:
             return
 
         self._seen_wallets[user] = now

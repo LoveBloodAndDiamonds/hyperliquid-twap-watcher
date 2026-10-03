@@ -94,6 +94,11 @@ class Websocket:
         """True, если соединение установлено и подписки отправлены."""
         return self._conn is not None
 
+    @property
+    def subscriptions(self) -> list[dict[str, Any]]:
+        """Подписки, которые отправляются на каждом подключении, в порядке отправки."""
+        return list(self._subscription_messages)
+
     async def start(self) -> None:
         """Держит соединение до вызова `stop()`. Возвращает управление только после остановки."""
         if self._running:
@@ -154,17 +159,38 @@ class Websocket:
 
         await conn.send(json.dumps(message))
 
-    async def add_subscription(self, message: dict[str, Any]) -> None:
+    async def add_subscription(self, message: dict[str, Any]) -> bool:
         """Добавляет подписку: отправляет ее сейчас и повторяет на каждом реконнекте.
 
-        :param message: Сообщение подписки.
+        :param message: Сообщение подписки `{"method": "subscribe", "subscription": {...}}`.
+        :return: True, если подписка отправлена сейчас. False — уйдет при подключении.
         """
         self._subscription_messages.append(message)
 
         # Без соединения подписка уйдет сама при следующем подключении.
+        if self._conn is None:
+            return False
+
+        try:
+            await self.send(message)
+        except Exception:
+            # Соединение умирает: после реконнекта подписка уйдет из общего списка.
+            return False
+        return True
+
+    async def remove_subscription(self, message: dict[str, Any]) -> None:
+        """Убирает подписку из списка реконнекта и отписывается в текущем соединении.
+
+        :param message: То же сообщение подписки, что передавалось в `add_subscription`.
+        """
+        if message not in self._subscription_messages:
+            return
+
+        self._subscription_messages.remove(message)
+
         if self._conn is not None:
             with suppress(Exception):
-                await self.send(message)
+                await self.send({**message, "method": "unsubscribe"})
 
     async def _run_connection(self) -> None:
         """Проживает одно соединение: от подключения до первой ошибки или остановки."""

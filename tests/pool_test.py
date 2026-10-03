@@ -1,58 +1,68 @@
-"""Пул `twapStates`: учет подписок, отказы биржи, отсев и дедупликация ордеров."""
+"""Поиск: учет подписок `twapStates`, отказы биржи, уход с занятой ноды."""
 
 import asyncio
 import time
 from typing import Any
 
-from hl_twap_watcher._markets import Markets
-from hl_twap_watcher._pool import TwapStatesPool, _SlotState
+from hl_twap_watcher._pool import DiscoveryPool, _Slot, _SlotState
 from hl_twap_watcher.config import WatcherConfig
 
 from .conftest import WALLET, make_state
 
+LIMIT_ERROR = {"channel": "error", "data": "Cannot track more than 15 total users"}
 
-def make_pool() -> tuple[TwapStatesPool, asyncio.Queue[str], list[tuple[int, dict[str, Any]]]]:
-    """Собирает пул со справочником из двух перпов и списком найденных ордеров."""
-    markets = Markets()
-    markets.apply_meta({"universe": [{"name": "BTC"}, {"name": "ETH"}]})
+
+def make_pool() -> tuple[DiscoveryPool, asyncio.Queue[str], list[tuple[int, dict[str, Any]]]]:
+    """Собирает пул без соединений и список переданных состояний TWAP."""
     queue: asyncio.Queue[str] = asyncio.Queue()
     found: list[tuple[int, dict[str, Any]]] = []
-    pool = TwapStatesPool(WatcherConfig(), markets, queue, lambda i, s: found.append((i, s)))
-    return pool, queue, found
+
+    async def on_twap(twap_id: int, state: dict[str, Any]) -> None:
+        found.append((twap_id, state))
+
+    return DiscoveryPool(WatcherConfig(), queue, on_twap), queue, found
 
 
-def states_message(*states: tuple[int, dict[str, Any]]) -> dict[str, Any]:
-    """Сообщение канала `twapStates`."""
+def confirm_message(user: str = WALLET) -> dict[str, Any]:
+    """Подтверждение подписки `twapStates`."""
     return {
-        "channel": "twapStates",
-        "data": {"dex": "", "user": WALLET, "states": [[i, s] for i, s in states]},
+        "channel": "subscriptionResponse",
+        "data": {"method": "subscribe", "subscription": {"type": "twapStates", "user": user}},
     }
 
 
-def test_subscription_confirm_moves_pending_to_tracked() -> None:
+async def test_subscription_confirm_moves_pending_to_tracked() -> None:
     pool, _, _ = make_pool()
     state = _SlotState()
     state.pending.append((WALLET, 0.0))
 
-    pool._handle_message(
-        state,
-        {
-            "channel": "subscriptionResponse",
-            "data": {"method": "subscribe", "subscription": {"type": "twapStates", "user": WALLET}},
-        },
-    )
+    await pool._handle_message(state, confirm_message())
 
     assert not state.pending
     assert WALLET in state.tracked
     assert pool.checked == 1
 
 
-def test_limit_error_requeues_oldest_pending() -> None:
+async def test_twap_states_are_forwarded() -> None:
+    pool, _, found = make_pool()
+
+    await pool._handle_message(
+        _SlotState(),
+        {
+            "channel": "twapStates",
+            "data": {"dex": "", "user": WALLET, "states": [[1, make_state()], [2, make_state()]]},
+        },
+    )
+
+    assert [twap_id for twap_id, _ in found] == [1, 2]
+
+
+async def test_limit_error_requeues_oldest_pending() -> None:
     pool, queue, _ = make_pool()
     state = _SlotState()
     state.pending.append((WALLET, 0.0))
 
-    pool._handle_message(state, {"channel": "error", "data": "Cannot track more than 15 total users"})
+    await pool._handle_message(state, LIMIT_ERROR)
 
     assert not state.pending
     assert queue.get_nowait() == WALLET
@@ -60,70 +70,33 @@ def test_limit_error_requeues_oldest_pending() -> None:
     assert state.blocked_until > 0
 
 
-def test_other_errors_are_ignored() -> None:
+async def test_other_errors_are_ignored() -> None:
     pool, queue, _ = make_pool()
     state = _SlotState()
     state.pending.append((WALLET, 0.0))
 
-    pool._handle_message(state, {"channel": "error", "data": "Already unsubscribed"})
+    await pool._handle_message(state, {"channel": "error", "data": "Already unsubscribed"})
 
     assert len(state.pending) == 1
     assert queue.empty()
 
 
-def test_twap_states_dedup_and_filter() -> None:
-    pool, _, found = make_pool()
-    state = _SlotState()
-
-    pool._handle_message(
-        state,
-        states_message(
-            (1, make_state(coin="BTC")),
-            (2, make_state(coin="@107")),  # спот
-            (3, make_state(coin="xyz:SP500")),  # builder-dex
-        ),
-    )
-    # Пока кошелек в подписке, биржа повторяет состояния — второй раз не отдаем.
-    pool._handle_message(state, states_message((1, make_state(coin="BTC"))))
-
-    assert [twap_id for twap_id, _ in found] == [1]
-
-
-def test_unknown_perp_is_not_remembered() -> None:
-    """Новый листинг, которого еще нет в справочнике, найдется после его обновления."""
-    pool, _, found = make_pool()
-    state = _SlotState()
-
-    pool._handle_message(state, states_message((1, make_state(coin="NEW"))))
-    pool._markets.apply_meta({"universe": [{"name": "BTC"}, {"name": "NEW"}]})
-    pool._handle_message(state, states_message((1, make_state(coin="NEW"))))
-
-    assert [twap_id for twap_id, _ in found] == [1]
-
-
-def test_reject_cooldown_grows_and_resets() -> None:
+async def test_reject_cooldown_grows_and_resets() -> None:
     pool, _, _ = make_pool()
     state = _SlotState()
-    limit_error = {"channel": "error", "data": "Cannot track more than 15 total users"}
 
     cooldowns = []
     for _ in range(6):
         state.pending.append((WALLET, 0.0))
         before = time.time()
-        pool._handle_message(state, limit_error)
+        await pool._handle_message(state, LIMIT_ERROR)
         cooldowns.append(round(state.blocked_until - before))
 
     assert cooldowns == [1, 2, 4, 8, 16, 16]
 
     # Успешная подписка сбрасывает серию.
     state.pending.append((WALLET, 0.0))
-    pool._handle_message(
-        state,
-        {
-            "channel": "subscriptionResponse",
-            "data": {"method": "subscribe", "subscription": {"type": "twapStates", "user": WALLET}},
-        },
-    )
+    await pool._handle_message(state, confirm_message())
     assert state.reject_streak == 0
 
 
@@ -138,17 +111,14 @@ class FakeWebsocket:
 
 
 async def test_crowded_node_triggers_reconnect_once_per_interval() -> None:
-    from hl_twap_watcher._pool import _Slot
-
     pool, queue, _ = make_pool()
     websocket = FakeWebsocket()
     slot = _Slot(websocket=websocket)  # type: ignore[arg-type]
-    limit_error = {"channel": "error", "data": "Cannot track more than 15 total users"}
 
     # Соединение почти пустое, а биржа отказывает — ноду занял кто-то еще.
     for _ in range(5):
         slot.state.pending.append((WALLET, 0.0))
-        pool._handle_message(slot.state, limit_error)
+        await pool._handle_message(slot.state, LIMIT_ERROR)
     slot.state.pending.append(("0xpending", 0.0))
 
     await pool._leave_crowded_node(slot)
@@ -160,13 +130,13 @@ async def test_crowded_node_triggers_reconnect_once_per_interval() -> None:
     assert "0xpending" in [queue.get_nowait() for _ in range(queue.qsize())]
 
 
-def test_rejects_on_full_connection_are_not_crowded() -> None:
+async def test_rejects_on_full_connection_are_not_crowded() -> None:
     pool, _, _ = make_pool()
     state = _SlotState()
     for index in range(13):
         state.tracked[f"0x{index}"] = 0.0
     state.pending.append((WALLET, 0.0))
 
-    pool._handle_message(state, {"channel": "error", "data": "Cannot track more than 15 total users"})
+    await pool._handle_message(state, LIMIT_ERROR)
 
     assert state.crowded_rejects == 0

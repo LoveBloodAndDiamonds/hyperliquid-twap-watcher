@@ -3,8 +3,6 @@
 import time
 from typing import Any
 
-import pytest
-
 from hl_twap_watcher._events import build_created
 from hl_twap_watcher.types import TwapCreatedEvent
 
@@ -83,12 +81,34 @@ def make_record(
     }
 
 
+def make_fill(
+    twap_id: int,
+    *,
+    time_ms: int,
+    tid: int = 1,
+    coin: str = "BTC",
+    side: str = "B",
+    px: str = "84000.0",
+    sz: str = "0.01",
+) -> dict[str, Any]:
+    """Элемент канала `userTwapSliceFills`: `{"fill": {...}, "twapId": ...}`."""
+    return {
+        "fill": {
+            "coin": coin,
+            "px": px,
+            "sz": sz,
+            "side": side,
+            "time": time_ms,
+            "hash": ZERO_HASH,
+            "tid": tid,
+            "twapId": None,
+        },
+        "twapId": twap_id,
+    }
+
+
 def make_created(twap_id: int = 100, **state_kwargs: Any) -> TwapCreatedEvent:
-    """Событие `created` для постановки ордера в регистр."""
-    return build_created(twap_id, make_state(**state_kwargs), mid_price=84000.0, now=time.time())
-
-
-@pytest.fixture
-def created() -> TwapCreatedEvent:
-    """Событие о найденном BTC-ордере на покупку."""
-    return make_created()
+    """Событие `created` по BTC-ордеру."""
+    return build_created(
+        twap_id, make_state(**state_kwargs), mid_price=84000.0, tracked=True, now=time.time()
+    )

@@ -1,27 +1,25 @@
-"""Пул WS-соединений, который проверяет кошельки-кандидаты и находит активные TWAP."""
+"""Поиск: пул WS-соединений, который проверяет кошельки-кандидаты и находит их TWAP."""
 
-__all__ = ["TwapStatesPool"]
+__all__ = ["DiscoveryPool"]
 
 import asyncio
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger as _logger
 
-from ._markets import Markets
+from ._tracker import SUBSCRIBE_LIMIT_ERROR
 from ._websocket import Websocket
 from .config import MAX_USERS_PER_WS, WatcherConfig
 from .types import LoggerLike
 
-type TwapStateHandler = Callable[[int, dict[str, Any]], None]
-"""Обработчик впервые увиденного перпового TWAP: `(twap_id, состояние с биржи)`."""
-
-_SUBSCRIBE_LIMIT_ERROR = "Cannot track more than"
-"""Начало текста ошибки, которой биржа отвечает на подписку сверх лимита."""
+type TwapStateHandler = Callable[[int, dict[str, Any]], Awaitable[None]]
+"""Обработчик состояния TWAP из `twapStates`: `(twap_id, состояние с биржи)`.
+Биржа повторяет состояния, пока кошелек в подписке, — дедупликация за обработчиком."""
 
 
 @dataclass
@@ -55,8 +53,8 @@ class _Slot:
     last_reconnect_at: float = 0.0
 
 
-class TwapStatesPool:
-    """Держит несколько WS-соединений и ротирует по ним подписки `twapStates`.
+class DiscoveryPool:
+    """Держит соединения поиска и ротирует по ним подписки `twapStates`.
 
     Подписка на `twapStates` возможна только по конкретному кошельку, а на одно
     соединение их влезает 14. Поэтому кандидат занимает слот на `watch_ttl` секунд —
@@ -90,7 +88,6 @@ class TwapStatesPool:
     def __init__(
         self,
         config: WatcherConfig,
-        markets: Markets,
         queue: asyncio.Queue[str],
         on_twap: TwapStateHandler,
         *,
@@ -99,22 +96,16 @@ class TwapStatesPool:
         """Инициализирует пул.
 
         :param config: Настройки наблюдателя.
-        :param markets: Справочник рынков: отсев спотовых и builder-dex ордеров.
         :param queue: Общая с потоком сделок очередь адресов на проверку.
-        :param on_twap: Обработчик впервые увиденного перпового TWAP.
+        :param on_twap: Обработчик каждого состояния TWAP из `twapStates`.
         :param logger: Логгер. По умолчанию — loguru.
         """
         self._config = config
-        self._markets = markets
         self._queue = queue
         self._on_twap = on_twap
         self._logger = logger or _logger
 
         self._slots: list[_Slot] = []
-
-        # ID ордера уникален только в паре с кошельком. OrderedDict вместо set:
-        # нужно вытеснять самые старые записи.
-        self._seen: OrderedDict[tuple[str, int], None] = OrderedDict()
 
         self.checked = 0
         """Сколько кошельков биржа реально приняла в подписку `twapStates`."""
@@ -129,8 +120,8 @@ class TwapStatesPool:
         """Сколько раз соединение пересоздавалось, чтобы уйти с занятой ноды."""
 
     async def start(self) -> None:
-        """Поднимает `watchers_count` независимых соединений."""
-        for index in range(self._config.watchers_count):
+        """Поднимает `discovery_connections` независимых соединений."""
+        for index in range(self._config.discovery_connections):
             slot = self._create_slot(index)
             slot.tasks = [
                 asyncio.create_task(slot.websocket.start()),
@@ -139,8 +130,8 @@ class TwapStatesPool:
             self._slots.append(slot)
 
         self._logger.info(
-            f"Twap states pool started: {self._config.watchers_count} connections, "
-            f"{self._config.pool_capacity} slots, ttl={self._config.watch_ttl}s"
+            f"Discovery pool started: {self._config.discovery_connections} connections, "
+            f"{self._config.discovery_capacity} slots, ttl={self._config.watch_ttl}s"
         )
 
     async def stop(self) -> None:
@@ -167,14 +158,14 @@ class TwapStatesPool:
 
         async def on_message(msg: dict[str, Any]) -> None:
             """Передает сообщение разбору с состоянием этого соединения."""
-            self._handle_message(slot.state, msg)
+            await self._handle_message(slot.state, msg)
 
         slot = _Slot(
             websocket=Websocket(
                 self._config.ws_url,
                 on_message,
                 on_connect=on_connect,
-                name=f"twap-states-{index}",
+                name=f"twap-discovery-{index}",
                 logger=self._logger,
             )
         )
@@ -198,7 +189,7 @@ class TwapStatesPool:
             except Exception as exc:
                 # Обычно это отправка в соединение, которое только что умерло:
                 # вебсокет переподключится сам, а состояние сбросит on_connect.
-                self._logger.debug(f"Twap states slot loop error: {exc!r}")
+                self._logger.debug(f"Discovery slot loop error: {exc!r}")
 
             await asyncio.sleep(self._POLL_INTERVAL)
 
@@ -215,7 +206,7 @@ class TwapStatesPool:
         slot.last_reconnect_at = now
         self.reconnects += 1
         self._logger.info(
-            f"Twap states connection shares exchange node limit "
+            f"Discovery connection shares exchange node limit "
             f"({state.crowded_rejects} rejects with {len(state.tracked)} own slots), reconnecting"
         )
 
@@ -274,7 +265,7 @@ class TwapStatesPool:
 
             state.pending.append((user, time.time()))
 
-    def _handle_message(self, state: _SlotState, msg: dict[str, Any]) -> None:
+    async def _handle_message(self, state: _SlotState, msg: dict[str, Any]) -> None:
         """Разбирает ответ соединения: подтверждение подписки, отказ или состояния TWAP."""
         channel = msg.get("channel")
 
@@ -290,7 +281,7 @@ class TwapStatesPool:
             return
 
         for twap_id, state_data in msg["data"].get("states", []):
-            self._handle_twap_state(int(twap_id), state_data)
+            await self._on_twap(int(twap_id), state_data)
 
     def _confirm_subscription(self, state: _SlotState, data: dict[str, Any]) -> None:
         """Переводит подтвержденную биржей подписку из ожидания в занятые слоты."""
@@ -312,9 +303,9 @@ class TwapStatesPool:
         """Освобождает слот, если биржа отказала в подписке по лимиту."""
         # Отказ приходит без адреса, поэтому относим его к самой старой подписке
         # без ответа: биржа отвечает в порядке запросов.
-        if not text.startswith(_SUBSCRIBE_LIMIT_ERROR) or not state.pending:
+        if not text.startswith(SUBSCRIBE_LIMIT_ERROR) or not state.pending:
             # Остальные ошибки безобидны: например, отписка от уже снятой подписки.
-            self._logger.debug(f"Twap states pool received error message: {text}")
+            self._logger.debug(f"Discovery pool received error message: {text}")
             return
 
         user, _ = state.pending.popleft()
@@ -333,21 +324,3 @@ class TwapStatesPool:
         state.blocked_until = time.time() + min(cooldown, self._MAX_REJECT_COOLDOWN)
         state.reject_streak += 1
         self._queue.put_nowait(user)
-
-    def _handle_twap_state(self, twap_id: int, data: dict[str, Any]) -> None:
-        """Отсеивает не-перпы и повторы, а впервые увиденный ордер отдает дальше."""
-        # twapStates отдает все ордера кошелька: спот (`@107`) и builder-dex
-        # (`xyz:SP500`) вне scope. Проверка до дедупликации: перп, листинг которого
-        # справочник еще не подхватил, не должен навсегда застрять в памяти повторов.
-        if not self._markets.is_perp(data["coin"]):
-            return
-
-        key = (data["user"].lower(), twap_id)
-        if key in self._seen:
-            return
-
-        self._seen[key] = None
-        while len(self._seen) > self._config.max_seen_twaps:
-            self._seen.popitem(last=False)
-
-        self._on_twap(twap_id, data)

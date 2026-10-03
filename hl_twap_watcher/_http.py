@@ -26,7 +26,7 @@ class ResponseError(Exception):
 
 
 class InfoClient:
-    """Клиент `POST /info`: только те запросы, что нужны наблюдателю.
+    """Клиент `POST /info`: только список перпов — остальное приходит по WebSocket.
 
     Повторяет запрос при таймаутах, сетевых ошибках, 429 и 5xx — логика
     позаимствована из `unicex._base.client`.
@@ -72,16 +72,6 @@ class InfoClient:
     async def perp_meta(self) -> dict[str, Any]:
         """Возвращает метаданные перпов основного dex: `{"universe": [...]}`."""
         return await self._post({"type": "meta"})
-
-    async def twap_history(self, user: str) -> list[dict[str, Any]]:
-        """Возвращает историю TWAP-ордеров кошелька, от свежих записей к старым.
-
-        Каждая запись — смена статуса ордера: `activated`, затем один из
-        `finished`, `terminated`, `stopped`, `error`.
-
-        :param user: Адрес кошелька.
-        """
-        return await self._post({"type": "twapHistory", "user": user})
 
     async def _post(self, payload: dict[str, Any]) -> Any:
         """Выполняет запрос с повторами и возвращает разобранный JSON."""
