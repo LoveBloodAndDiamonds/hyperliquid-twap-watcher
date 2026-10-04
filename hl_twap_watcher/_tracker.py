@@ -13,6 +13,7 @@ from typing import Any
 from loguru import logger as _logger
 
 from ._events import FINISH_REASONS, build_finished, build_slice, latest_records, record_status
+from ._node_backoff import NodeBackoff
 from ._websocket import Websocket
 from .config import MAX_USERS_PER_WS, WatcherConfig
 from .types import LoggerLike, TwapEvent
@@ -74,13 +75,9 @@ class _Connection:
     pending: deque[tuple[str, str, float]] = field(default_factory=deque)
     """Подписки «кошелек, канал, время отправки», на которые биржа еще не ответила."""
 
-    crowded: bool = False
-    """Биржа отказала в подписке: ноду соединения делит кто-то еще."""
+    backoff: NodeBackoff = field(default_factory=NodeBackoff)
+    """Уход с занятой ноды: биржа отказала в подписке — ноду делит кто-то еще."""
 
-    last_reconnect_at: float = 0.0
-
-    reconnect_streak: int = 0
-    """Сколько раз подряд соединение уходило с занятой ноды: от этого растет пауза."""
     tasks: list[asyncio.Task] = field(default_factory=list)
 
 
@@ -100,14 +97,6 @@ class TwapTracker:
 
     _PENDING_TIMEOUT = 5.0
     """Сколько ждать ответ биржи на подписку, прежде чем забыть о ней."""
-
-    _RECONNECT_DELAYS = (5.0, 10.0, 20.0, 40.0, 60.0)
-    """Паузы между переподключениями подряд, секунды. Свободная нода находится
-    примерно с каждой третьей попытки — первые попытки идут быстро. Дальше пауза
-    растет: если ноды заняты другим приложением на том же IP, спешка не поможет."""
-
-    _STABLE_SECONDS = 120.0
-    """Сколько соединение должно продержаться без отказов, чтобы серия обнулилась."""
 
     def __init__(
         self,
@@ -240,7 +229,7 @@ class TwapTracker:
                 (sub["subscription"]["user"], sub["subscription"]["type"], now)
                 for sub in connection.websocket.subscriptions
             )
-            connection.crowded = False
+            connection.backoff.crowded = False
 
         async def on_message(msg: dict[str, Any]) -> None:
             """Разбирает сообщение этого соединения."""
@@ -297,7 +286,7 @@ class TwapTracker:
         # Соединение держит не больше 14 кошельков при лимите ноды 15: отказ значит,
         # что ноду делит кто-то еще. Кошелек остается за соединением — после
         # переподключения подписка повторится, а снапшот вернет пропущенное.
-        connection.crowded = True
+        connection.backoff.crowded = True
         self._logger.warning(
             f"Tracking subscription {channel} for {wallet} rejected by exchange node limit"
         )
@@ -379,25 +368,10 @@ class TwapTracker:
     async def _leave_crowded_node(self, connection: _Connection) -> None:
         """Пересоздает соединение, если его нода занята: подписки повторятся на новой."""
         now = time.time()
-        since_reconnect = now - connection.last_reconnect_at
-
-        if not connection.crowded:
-            # Соединение прижилось на свободной ноде — следующая серия начнется заново.
-            if since_reconnect > self._STABLE_SECONDS:
-                connection.reconnect_streak = 0
+        if not connection.backoff.should_reconnect(now) or not connection.websocket.connected:
             return
 
-        if not connection.websocket.connected:
-            return
-
-        # Первый уход с ноды — сразу, следующие подряд — с растущей паузой.
-        if connection.reconnect_streak > 0:
-            index = min(connection.reconnect_streak, len(self._RECONNECT_DELAYS)) - 1
-            if since_reconnect < self._RECONNECT_DELAYS[index]:
-                return
-
-        connection.last_reconnect_at = now
-        connection.reconnect_streak += 1
+        connection.backoff.reconnecting(now)
         self.reconnects += 1
         self._logger.info(
             f"Twap tracker connection shares exchange node limit "

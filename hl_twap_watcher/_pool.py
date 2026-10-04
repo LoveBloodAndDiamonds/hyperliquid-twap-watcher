@@ -12,6 +12,7 @@ from typing import Any
 
 from loguru import logger as _logger
 
+from ._node_backoff import NodeBackoff
 from ._tracker import SUBSCRIBE_LIMIT_ERROR
 from ._websocket import Websocket
 from .config import MAX_USERS_PER_WS, WatcherConfig
@@ -38,10 +39,6 @@ class _SlotState:
     reject_streak: int = 0
     """Сколько отказов подряд получило соединение: от этого растет пауза."""
 
-    crowded_rejects: int = 0
-    """Сколько отказов пришло, когда само соединение занимало меньше половины слотов.
-    Признак того, что лимит его ноды съедает кто-то еще."""
-
 
 @dataclass
 class _Slot:
@@ -50,7 +47,8 @@ class _Slot:
     websocket: Websocket
     state: _SlotState = field(default_factory=_SlotState)
     tasks: list[asyncio.Task] = field(default_factory=list)
-    last_reconnect_at: float = 0.0
+    backoff: NodeBackoff = field(default_factory=NodeBackoff)
+    """Уход с занятой ноды. Живет дольше состояния: переживает реконнекты."""
 
 
 class DiscoveryPool:
@@ -77,13 +75,6 @@ class DiscoveryPool:
 
     _PENDING_TIMEOUT = 5.0
     """Сколько ждать ответ биржи на подписку, прежде чем считать слот свободным."""
-
-    _CROWDED_REJECTS_TO_RECONNECT = 5
-    """После скольких отказов на занятой ноде соединение пересоздается."""
-
-    _MIN_RECONNECT_INTERVAL = 60.0
-    """Не чаще одного пересоздания соединения за столько секунд: если ноды заняты
-    другим приложением на том же IP, переподключения не помогут."""
 
     def __init__(
         self,
@@ -155,10 +146,11 @@ class DiscoveryPool:
         async def on_connect() -> None:
             """Сбрасывает состояние: подписки прошлого соединения умерли вместе с ним."""
             slot.state = _SlotState()
+            slot.backoff.crowded = False
 
         async def on_message(msg: dict[str, Any]) -> None:
             """Передает сообщение разбору с состоянием этого соединения."""
-            await self._handle_message(slot.state, msg)
+            await self._handle_message(slot, msg)
 
         slot = _Slot(
             websocket=Websocket(
@@ -198,16 +190,14 @@ class DiscoveryPool:
         state = slot.state
         now = time.time()
 
-        if state.crowded_rejects < self._CROWDED_REJECTS_TO_RECONNECT:
-            return
-        if now - slot.last_reconnect_at < self._MIN_RECONNECT_INTERVAL:
+        if not slot.backoff.should_reconnect(now):
             return
 
-        slot.last_reconnect_at = now
+        slot.backoff.reconnecting(now)
         self.reconnects += 1
         self._logger.info(
             f"Discovery connection shares exchange node limit "
-            f"({state.crowded_rejects} rejects with {len(state.tracked)} own slots), reconnecting"
+            f"({len(state.tracked)} own slots), reconnecting"
         )
 
         # Кандидаты без ответа биржи еще не проверены — не теряем их.
@@ -265,16 +255,16 @@ class DiscoveryPool:
 
             state.pending.append((user, time.time()))
 
-    async def _handle_message(self, state: _SlotState, msg: dict[str, Any]) -> None:
+    async def _handle_message(self, slot: _Slot, msg: dict[str, Any]) -> None:
         """Разбирает ответ соединения: подтверждение подписки, отказ или состояния TWAP."""
         channel = msg.get("channel")
 
         if channel == "subscriptionResponse":
-            self._confirm_subscription(state, msg["data"])
+            self._confirm_subscription(slot.state, msg["data"])
             return
 
         if channel == "error":
-            self._handle_error(state, str(msg.get("data", "")))
+            self._handle_error(slot, str(msg.get("data", "")))
             return
 
         if channel != "twapStates":
@@ -299,8 +289,10 @@ class DiscoveryPool:
         state.reject_streak = 0
         self.checked += 1
 
-    def _handle_error(self, state: _SlotState, text: str) -> None:
+    def _handle_error(self, slot: _Slot, text: str) -> None:
         """Освобождает слот, если биржа отказала в подписке по лимиту."""
+        state = slot.state
+
         # Отказ приходит без адреса, поэтому относим его к самой старой подписке
         # без ответа: биржа отвечает в порядке запросов.
         if not text.startswith(SUBSCRIBE_LIMIT_ERROR) or not state.pending:
@@ -311,10 +303,10 @@ class DiscoveryPool:
         user, _ = state.pending.popleft()
         self.rejected += 1
 
-        # Своя нода вмещает 15 подписок, а соединение занимает 14. Отказ при
-        # полупустом соединении значит, что слоты ноды заняты другим соединением.
-        if len(state.tracked) < MAX_USERS_PER_WS // 2:
-            state.crowded_rejects += 1
+        # Нода вмещает 15 подписок, а соединение занимает не больше 14: отказ значит,
+        # что слоты ноды заняты кем-то еще. Даже если своих слотов много, соединение
+        # работает не в полную силу — лучше перейти на свободную ноду.
+        slot.backoff.crowded = True
 
         # Лимит общий на все соединения, поэтому упереться в него можно и с
         # пустыми слотами. Даем бирже паузу и возвращаем кошелек в очередь. Пауза

@@ -4,12 +4,22 @@ import asyncio
 import time
 from typing import Any
 
-from hl_twap_watcher._pool import DiscoveryPool, _Slot, _SlotState
+from hl_twap_watcher._pool import DiscoveryPool, _Slot
 from hl_twap_watcher.config import WatcherConfig
 
 from .conftest import WALLET, make_state
 
 LIMIT_ERROR = {"channel": "error", "data": "Cannot track more than 15 total users"}
+
+
+class FakeWebsocket:
+    """Запоминает запросы на пересоздание соединения."""
+
+    def __init__(self) -> None:
+        self.reconnects = 0
+
+    async def reconnect(self) -> None:
+        self.reconnects += 1
 
 
 def make_pool() -> tuple[DiscoveryPool, asyncio.Queue[str], list[tuple[int, dict[str, Any]]]]:
@@ -23,6 +33,12 @@ def make_pool() -> tuple[DiscoveryPool, asyncio.Queue[str], list[tuple[int, dict
     return DiscoveryPool(WatcherConfig(), queue, on_twap), queue, found
 
 
+def make_slot() -> tuple[_Slot, FakeWebsocket]:
+    """Соединение пула с фейковым вебсокетом."""
+    websocket = FakeWebsocket()
+    return _Slot(websocket=websocket), websocket  # type: ignore[arg-type]
+
+
 def confirm_message(user: str = WALLET) -> dict[str, Any]:
     """Подтверждение подписки `twapStates`."""
     return {
@@ -33,21 +49,22 @@ def confirm_message(user: str = WALLET) -> dict[str, Any]:
 
 async def test_subscription_confirm_moves_pending_to_tracked() -> None:
     pool, _, _ = make_pool()
-    state = _SlotState()
-    state.pending.append((WALLET, 0.0))
+    slot, _ = make_slot()
+    slot.state.pending.append((WALLET, 0.0))
 
-    await pool._handle_message(state, confirm_message())
+    await pool._handle_message(slot, confirm_message())
 
-    assert not state.pending
-    assert WALLET in state.tracked
+    assert not slot.state.pending
+    assert WALLET in slot.state.tracked
     assert pool.checked == 1
 
 
 async def test_twap_states_are_forwarded() -> None:
     pool, _, found = make_pool()
+    slot, _ = make_slot()
 
     await pool._handle_message(
-        _SlotState(),
+        slot,
         {
             "channel": "twapStates",
             "data": {"dex": "", "user": WALLET, "states": [[1, make_state()], [2, make_state()]]},
@@ -59,84 +76,76 @@ async def test_twap_states_are_forwarded() -> None:
 
 async def test_limit_error_requeues_oldest_pending() -> None:
     pool, queue, _ = make_pool()
-    state = _SlotState()
-    state.pending.append((WALLET, 0.0))
+    slot, _ = make_slot()
+    slot.state.pending.append((WALLET, 0.0))
 
-    await pool._handle_message(state, LIMIT_ERROR)
+    await pool._handle_message(slot, LIMIT_ERROR)
 
-    assert not state.pending
+    assert not slot.state.pending
     assert queue.get_nowait() == WALLET
     assert pool.rejected == 1
-    assert state.blocked_until > 0
+    assert slot.state.blocked_until > 0
 
 
 async def test_other_errors_are_ignored() -> None:
     pool, queue, _ = make_pool()
-    state = _SlotState()
-    state.pending.append((WALLET, 0.0))
+    slot, _ = make_slot()
+    slot.state.pending.append((WALLET, 0.0))
 
-    await pool._handle_message(state, {"channel": "error", "data": "Already unsubscribed"})
+    await pool._handle_message(slot, {"channel": "error", "data": "Already unsubscribed"})
 
-    assert len(state.pending) == 1
+    assert len(slot.state.pending) == 1
     assert queue.empty()
+    assert not slot.backoff.crowded
 
 
 async def test_reject_cooldown_grows_and_resets() -> None:
     pool, _, _ = make_pool()
-    state = _SlotState()
+    slot, _ = make_slot()
 
     cooldowns = []
     for _ in range(6):
-        state.pending.append((WALLET, 0.0))
+        slot.state.pending.append((WALLET, 0.0))
         before = time.time()
-        await pool._handle_message(state, LIMIT_ERROR)
-        cooldowns.append(round(state.blocked_until - before))
+        await pool._handle_message(slot, LIMIT_ERROR)
+        cooldowns.append(round(slot.state.blocked_until - before))
 
     assert cooldowns == [1, 2, 4, 8, 16, 16]
 
     # Успешная подписка сбрасывает серию.
-    state.pending.append((WALLET, 0.0))
-    await pool._handle_message(state, confirm_message())
-    assert state.reject_streak == 0
+    slot.state.pending.append((WALLET, 0.0))
+    await pool._handle_message(slot, confirm_message())
+    assert slot.state.reject_streak == 0
 
 
-class FakeWebsocket:
-    """Запоминает запросы на пересоздание соединения."""
+async def test_any_limit_reject_marks_node_crowded() -> None:
+    """Даже почти полное соединение уходит с ноды: оно работает не в полную силу."""
+    pool, _, _ = make_pool()
+    slot, _ = make_slot()
+    for index in range(13):
+        slot.state.tracked[f"0x{index}"] = 0.0
+    slot.state.pending.append((WALLET, 0.0))
 
-    def __init__(self) -> None:
-        self.reconnects = 0
+    await pool._handle_message(slot, LIMIT_ERROR)
 
-    async def reconnect(self) -> None:
-        self.reconnects += 1
+    assert slot.backoff.crowded
 
 
-async def test_crowded_node_triggers_reconnect_once_per_interval() -> None:
+async def test_crowded_node_reconnects_and_requeues_pending() -> None:
     pool, queue, _ = make_pool()
-    websocket = FakeWebsocket()
-    slot = _Slot(websocket=websocket)  # type: ignore[arg-type]
+    slot, websocket = make_slot()
 
-    # Соединение почти пустое, а биржа отказывает — ноду занял кто-то еще.
-    for _ in range(5):
-        slot.state.pending.append((WALLET, 0.0))
-        await pool._handle_message(slot.state, LIMIT_ERROR)
+    slot.state.pending.append((WALLET, 0.0))
+    await pool._handle_message(slot, LIMIT_ERROR)
     slot.state.pending.append(("0xpending", 0.0))
 
-    await pool._leave_crowded_node(slot)
-    await pool._leave_crowded_node(slot)  # второй раз раньше интервала — нет
-
+    await pool._leave_crowded_node(slot)  # первый уход — сразу
     assert websocket.reconnects == 1
     assert pool.reconnects == 1
     # Непроверенный кандидат вернулся в очередь.
     assert "0xpending" in [queue.get_nowait() for _ in range(queue.qsize())]
 
-
-async def test_rejects_on_full_connection_are_not_crowded() -> None:
-    pool, _, _ = make_pool()
-    state = _SlotState()
-    for index in range(13):
-        state.tracked[f"0x{index}"] = 0.0
-    state.pending.append((WALLET, 0.0))
-
-    await pool._handle_message(state, LIMIT_ERROR)
-
-    assert state.crowded_rejects == 0
+    # Новая нода тоже занята: повтор только после паузы.
+    slot.backoff.crowded = True
+    await pool._leave_crowded_node(slot)
+    assert websocket.reconnects == 1
