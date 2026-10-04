@@ -1,6 +1,6 @@
 [project]
 name = "hyperliquid-twap-watcher"
-version = "0.1.0"
+version = "0.1.1"
 
 description = "Async watcher for Hyperliquid TWAP orders: new TWAPs, slice fills and completions delivered to callbacks"
 readme = "README.md"
